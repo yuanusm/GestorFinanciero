@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from audio_pipeline import AudioPipelineError, transcribe_voice_message
 from config import Settings, load_settings
-from database import initialize_database, insert_transaction
+from database import Transaction, initialize_database, insert_transaction
+from fusion import fuse_transaction
+from intent_router import ReportPeriod, route_intent
 from parser import parse_transaction
-from reporting import export_summary_chart, format_summary, generate_daily_summary, generate_weekly_summary
+from qwen_analyzer import QwenAnalysisError, analyze_with_qwen
+from reporting import export_report_charts, format_summary, generate_summary
 from whisper_runner import WhisperError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -19,7 +23,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process authorized Telegram voice messages into stored transactions."""
+    """Process authorized Telegram voice messages through the local pipeline."""
     settings: Settings = context.application.bot_data["settings"]
     if not _is_authorized(update, settings):
         LOGGER.info("Ignoring message from unauthorized user")
@@ -33,24 +37,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         telegram_file = await context.bot.get_file(voice.file_id)
         await telegram_file.download_to_drive(custom_path=ogg_path)
         transcript = transcribe_voice_message(ogg_path, settings)
-        transaction = parse_transaction(transcript)
-        if transaction is None:
-            await update.message.reply_text(f"I transcribed this, but could not find an amount: {transcript}")
-            return
-        row_id = insert_transaction(settings.database_path, transaction)
     except (AudioPipelineError, WhisperError, OSError) as exc:
-        LOGGER.exception("Voice processing failed")
-        await update.message.reply_text(f"Could not process the voice message safely: {exc}")
+        LOGGER.exception("Voice transcription failed")
+        await update.message.reply_text("No pude procesar el audio de forma segura. Revisa los logs locales para más detalles.")
         return
 
-    await update.message.reply_text(
-        "Transaction saved\n"
-        f"ID: {row_id}\n"
-        f"Text: {transcript}\n"
-        f"Type: {transaction.transaction_type}\n"
-        f"Category: {transaction.category}\n"
-        f"Amount: ${transaction.amount_clp:,} CLP"
-    )
+    await _handle_text_intent(update, context, transcript)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Process authorized Spanish text messages without requiring voice input."""
+    settings: Settings = context.application.bot_data["settings"]
+    if not _is_authorized(update, settings):
+        LOGGER.info("Ignoring message from unauthorized user")
+        return
+    if update.message is None or update.message.text is None:
+        return
+    await _handle_text_intent(update, context, update.message.text)
 
 
 async def daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -63,27 +66,105 @@ async def weekly_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _send_report(update, context, period="weekly")
 
 
-async def _send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str) -> None:
+async def monthly_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a monthly text and PNG report to the authorized user."""
+    await _send_report(update, context, period="monthly")
+
+
+async def historical_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a full historical text and PNG report to the authorized user."""
+    await _send_report(update, context, period="historical")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send Spanish usage help."""
+    settings: Settings = context.application.bot_data["settings"]
+    if not _is_authorized(update, settings) or update.message is None:
+        return
+    await update.message.reply_text(
+        "Puedo registrar gastos e ingresos desde audios o texto.\n"
+        "Ejemplos:\n"
+        "- gasté 12 lucas en sushi\n"
+        "- me devolvieron 5 mil\n\n"
+        "Reportes disponibles:\n"
+        "/daily o /diario\n"
+        "/weekly o /semanal\n"
+        "/monthly o /mensual\n"
+        "/history o /historico"
+    )
+
+
+async def _handle_text_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    if update.message is None:
+        return
+    intent = route_intent(text)
+    if intent.intent_type == "report" and intent.report_period is not None:
+        await _send_report(update, context, period=intent.report_period)
+        return
+
+    settings: Settings = context.application.bot_data["settings"]
+    transaction = _analyze_transaction(text, settings)
+    if transaction is None:
+        await update.message.reply_text(
+            "Transcribí/recibí el mensaje, pero no pude detectar un monto válido. "
+            f"Texto: {text}"
+        )
+        return
+
+    try:
+        row_id = insert_transaction(settings.database_path, transaction)
+    except ValueError as exc:
+        LOGGER.exception("Rejected invalid transaction")
+        await update.message.reply_text("No pude guardar la transacción porque los datos no son válidos.")
+        return
+
+    await update.message.reply_text(
+        "✅ Transacción guardada\n"
+        f"ID: {row_id}\n"
+        f"Texto: {text}\n"
+        f"Tipo: {_type_label(transaction.transaction_type)}\n"
+        f"Categoría: {transaction.category}\n"
+        f"Descripción: {transaction.description}\n"
+        f"Monto: ${transaction.amount_clp:,} CLP"
+    )
+
+
+def _analyze_transaction(text: str, settings: Settings) -> Transaction | None:
+    deterministic = parse_transaction(text)
+    semantic = None
+    try:
+        semantic = analyze_with_qwen(text, settings)
+    except QwenAnalysisError:
+        LOGGER.exception("Local Qwen semantic analysis failed; continuing with deterministic parser")
+    return fuse_transaction(text, deterministic, semantic)
+
+
+async def _send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, period: ReportPeriod) -> None:
     settings: Settings = context.application.bot_data["settings"]
     if not _is_authorized(update, settings):
         return
     if update.message is None:
         return
 
-    summary = (
-        generate_daily_summary(settings.database_path)
-        if period == "daily"
-        else generate_weekly_summary(settings.database_path)
-    )
-    chart_path = export_summary_chart(summary, settings.report_dir / f"{period}_{summary.start.date()}.png")
+    summary = generate_summary(settings.database_path, period)
     await update.message.reply_text(format_summary(summary))
-    with chart_path.open("rb") as chart_file:
-        await update.message.reply_photo(photo=chart_file)
+    try:
+        chart_paths = export_report_charts(summary, settings.report_dir)
+        for chart_path in chart_paths:
+            with chart_path.open("rb") as chart_file:
+                await update.message.reply_photo(photo=chart_file)
+    except (RuntimeError, OSError) as exc:
+        LOGGER.exception("Report chart export failed")
+        await update.message.reply_text("No pude generar los PNG del reporte. Revisa que matplotlib esté instalado localmente.")
 
 
 def _is_authorized(update: Update, settings: Settings) -> bool:
     user = update.effective_user
     return user is not None and str(user.id) == settings.authorized_telegram_user_id
+
+
+def _type_label(transaction_type: str) -> str:
+    return "ingreso" if transaction_type == "income" else "gasto"
 
 
 def build_application(settings: Settings) -> Application:
@@ -93,9 +174,13 @@ def build_application(settings: Settings) -> Application:
 
     application = Application.builder().token(settings.telegram_bot_token).build()
     application.bot_data["settings"] = settings
+    application.add_handler(CommandHandler(["daily", "diario"], daily_report))
+    application.add_handler(CommandHandler(["weekly", "semanal"], weekly_report))
+    application.add_handler(CommandHandler(["monthly", "mensual"], monthly_report))
+    application.add_handler(CommandHandler(["history", "historico", "histórico"], historical_report))
+    application.add_handler(CommandHandler(["start", "help", "ayuda"], help_command))
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    application.add_handler(CommandHandler("daily", daily_report))
-    application.add_handler(CommandHandler("weekly", weekly_report))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     return application
 
 

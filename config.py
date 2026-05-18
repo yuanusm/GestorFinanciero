@@ -28,6 +28,14 @@ class Settings:
     ffmpeg_binary: Path = field(default_factory=lambda: Path(os.environ.get("FFMPEG_BINARY", "ffmpeg")))
     whisper_threads: int = field(default_factory=lambda: int(os.environ.get("WHISPER_THREADS", "4")))
     whisper_language: str = field(default_factory=lambda: os.environ.get("WHISPER_LANGUAGE", "es"))
+    qwen_enabled: bool = field(default_factory=lambda: os.environ.get("QWEN_ENABLED", "0") == "1")
+    qwen_runner_binary: Path = field(
+        default_factory=lambda: Path(os.environ.get("QWEN_RUNNER_BINARY", "llama.cpp/build/bin/llama-cli"))
+    )
+    qwen_model_path: Path = field(default_factory=lambda: Path(os.environ.get("QWEN_MODEL_PATH", "models/qwen.gguf")))
+    qwen_threads: int = field(default_factory=lambda: int(os.environ.get("QWEN_THREADS", "4")))
+    qwen_max_tokens: int = field(default_factory=lambda: int(os.environ.get("QWEN_MAX_TOKENS", "160")))
+    qwen_timeout_seconds: int = field(default_factory=lambda: int(os.environ.get("QWEN_TIMEOUT_SECONDS", "45")))
 
     @property
     def voice_dir(self) -> Path:

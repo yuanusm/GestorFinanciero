@@ -1,4 +1,8 @@
-"""SQLite persistence layer for financial transactions."""
+"""SQLite persistence layer for financial transactions.
+
+All SQL in this module is fixed and parameterized. The Telegram layer never receives
+or executes arbitrary SQL text.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
     raw_text TEXT NOT NULL,
-    amount_clp INTEGER NOT NULL,
+    amount_clp INTEGER NOT NULL CHECK (amount_clp >= 0),
     transaction_type TEXT NOT NULL CHECK (transaction_type IN ('expense', 'income')),
     category TEXT NOT NULL,
     description TEXT NOT NULL
@@ -45,8 +49,11 @@ class StoredTransaction(Transaction):
 
 
 def _connect(database_path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(database_path)
+    connection = sqlite3.connect(database_path, timeout=30)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 5000")
     return connection
 
 
@@ -59,6 +66,7 @@ def initialize_database(database_path: Path) -> None:
 
 def insert_transaction(database_path: Path, transaction: Transaction) -> int:
     """Persist a transaction and return its SQLite row id."""
+    _validate_transaction(transaction)
     timestamp = transaction.timestamp or datetime.now(timezone.utc)
     with _connect(database_path) as connection:
         cursor = connection.execute(
@@ -95,16 +103,40 @@ def fetch_transactions_between(
             """,
             (start.isoformat(), end.isoformat()),
         ).fetchall()
+    return [_row_to_transaction(row) for row in rows]
 
-    return [
-        StoredTransaction(
-            id=int(row["id"]),
-            timestamp=datetime.fromisoformat(row["timestamp"]),
-            raw_text=str(row["raw_text"]),
-            amount_clp=int(row["amount_clp"]),
-            transaction_type=str(row["transaction_type"]),
-            category=str(row["category"]),
-            description=str(row["description"]),
-        )
-        for row in rows
-    ]
+
+def fetch_all_transactions(database_path: Path) -> list[StoredTransaction]:
+    """Fetch all transactions for full historical reporting."""
+    with _connect(database_path) as connection:
+        rows: Iterable[sqlite3.Row] = connection.execute(
+            """
+            SELECT id, timestamp, raw_text, amount_clp, transaction_type, category, description
+            FROM transactions
+            ORDER BY timestamp ASC
+            """
+        ).fetchall()
+    return [_row_to_transaction(row) for row in rows]
+
+
+def _row_to_transaction(row: sqlite3.Row) -> StoredTransaction:
+    return StoredTransaction(
+        id=int(row["id"]),
+        timestamp=datetime.fromisoformat(row["timestamp"]),
+        raw_text=str(row["raw_text"]),
+        amount_clp=int(row["amount_clp"]),
+        transaction_type=str(row["transaction_type"]),
+        category=str(row["category"]),
+        description=str(row["description"]),
+    )
+
+
+def _validate_transaction(transaction: Transaction) -> None:
+    if transaction.amount_clp < 0:
+        raise ValueError("amount_clp must be non-negative")
+    if transaction.transaction_type not in {"expense", "income"}:
+        raise ValueError("transaction_type must be 'expense' or 'income'")
+    if not transaction.category.strip():
+        raise ValueError("category must not be empty")
+    if not transaction.description.strip():
+        raise ValueError("description must not be empty")

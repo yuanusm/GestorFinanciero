@@ -4,3 +4,5 @@ __pycache__/
 data/
 *.sqlite3
 whisper.cpp/
+llama.cpp/
+models/
