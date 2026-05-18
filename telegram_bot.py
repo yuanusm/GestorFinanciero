@@ -10,10 +10,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from audio_pipeline import AudioPipelineError, transcribe_voice_message
 from config import Settings, load_settings
+from ambiguity_detector import detect_ambiguity
 from database import Transaction, initialize_database, insert_transaction
-from fusion import fuse_transaction
+from financial_filter import is_financially_relevant
+from fusion import fuse_transactions
 from intent_router import ReportPeriod, route_intent
-from parser import parse_transaction
+from parser import parse_transactions
 from qwen_analyzer import QwenAnalysisError, analyze_with_qwen
 from reporting import export_report_charts, format_summary, generate_summary
 from whisper_runner import WhisperError
@@ -97,46 +99,64 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _handle_text_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     if update.message is None:
         return
+    if not is_financially_relevant(text):
+        LOGGER.info("Ignoring non-financial message before Qwen fallback")
+        return
+
     intent = route_intent(text)
     if intent.intent_type == "report" and intent.report_period is not None:
         await _send_report(update, context, period=intent.report_period)
         return
 
     settings: Settings = context.application.bot_data["settings"]
-    transaction = _analyze_transaction(text, settings)
-    if transaction is None:
+    parsed = parse_transactions(text)
+    ambiguity = detect_ambiguity(parsed)
+    semantic = None
+    if ambiguity.needs_qwen:
+        LOGGER.info("Using Qwen fallback: %s", ambiguity.reason)
+        try:
+            semantic = analyze_with_qwen(text, settings)
+        except QwenAnalysisError:
+            LOGGER.exception("Local Qwen fallback failed; continuing with deterministic parser")
+
+    if semantic is not None and semantic.intent == "dashboard":
+        await _send_report(update, context, period=semantic.report_period or "weekly")
+        return
+
+    transactions = fuse_transactions(text, parsed, semantic)
+    if not transactions:
         await update.message.reply_text(
-            "Transcribí/recibí el mensaje, pero no pude detectar un monto válido. "
-            f"Texto: {text}"
+            "Entendí que el mensaje era financiero, pero no pude detectar una transacción clara. "
+            "Puedes decir, por ejemplo: 'gasté 12 lucas en sushi'."
         )
         return
 
+    saved_ids: list[int] = []
     try:
-        row_id = insert_transaction(settings.database_path, transaction)
-    except ValueError as exc:
+        for transaction in transactions:
+            saved_ids.append(insert_transaction(settings.database_path, transaction))
+    except ValueError:
         LOGGER.exception("Rejected invalid transaction")
         await update.message.reply_text("No pude guardar la transacción porque los datos no son válidos.")
         return
 
-    await update.message.reply_text(
-        "✅ Transacción guardada\n"
-        f"ID: {row_id}\n"
-        f"Texto: {text}\n"
-        f"Tipo: {_type_label(transaction.transaction_type)}\n"
-        f"Categoría: {transaction.category}\n"
-        f"Descripción: {transaction.description}\n"
-        f"Monto: ${transaction.amount_clp:,} CLP"
-    )
+    await update.message.reply_text(_format_saved_transactions(saved_ids, transactions, text))
 
 
 def _analyze_transaction(text: str, settings: Settings) -> Transaction | None:
-    deterministic = parse_transaction(text)
+    """Backward-compatible single transaction analyzer used by older callers/tests."""
+    if not is_financially_relevant(text):
+        return None
+    parsed = parse_transactions(text)
+    ambiguity = detect_ambiguity(parsed)
     semantic = None
-    try:
-        semantic = analyze_with_qwen(text, settings)
-    except QwenAnalysisError:
-        LOGGER.exception("Local Qwen semantic analysis failed; continuing with deterministic parser")
-    return fuse_transaction(text, deterministic, semantic)
+    if ambiguity.needs_qwen:
+        try:
+            semantic = analyze_with_qwen(text, settings)
+        except QwenAnalysisError:
+            LOGGER.exception("Local Qwen fallback failed; continuing with deterministic parser")
+    transactions = fuse_transactions(text, parsed, semantic)
+    return transactions[0] if transactions else None
 
 
 async def _send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, period: ReportPeriod) -> None:
@@ -156,6 +176,23 @@ async def _send_report(update: Update, context: ContextTypes.DEFAULT_TYPE, perio
     except (RuntimeError, OSError) as exc:
         LOGGER.exception("Report chart export failed")
         await update.message.reply_text("No pude generar los PNG del reporte. Revisa que matplotlib esté instalado localmente.")
+
+
+def _format_saved_transactions(saved_ids: list[int], transactions: list[Transaction], raw_text: str) -> str:
+    header = "✅ Transacción guardada" if len(transactions) == 1 else f"✅ {len(transactions)} transacciones guardadas"
+    lines = [header, f"Texto: {raw_text}"]
+    for row_id, transaction in zip(saved_ids, transactions, strict=True):
+        lines.extend(
+            [
+                "",
+                f"ID: {row_id}",
+                f"Tipo: {_type_label(transaction.transaction_type)}",
+                f"Categoría: {transaction.category}",
+                f"Descripción: {transaction.description}",
+                f"Monto: ${transaction.amount_clp:,} CLP",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _is_authorized(update: Update, settings: Settings) -> bool:

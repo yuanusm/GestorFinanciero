@@ -3,115 +3,125 @@
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 
 from database import Transaction
+from money_parser import MoneySegment, extract_money_segments
+from text_normalizer import normalize_text
 
 LOGGER = logging.getLogger(__name__)
 
 EXPENSE_KEYWORDS = (
-    "gasté",
     "gaste",
-    "pagué",
     "pague",
-    "compré",
     "compre",
-    "salió",
+    "compramos",
     "salio",
-    "me costó",
-    "me costo",
+    "costo",
+    "costaron",
+    "transferi",
+    "envie",
 )
 INCOME_KEYWORDS = (
-    "recibí",
     "recibi",
     "me pagaron",
     "me devolvieron",
+    "devolvieron",
     "depositaron",
-    "ingresó",
     "ingreso",
-    "transferencia recibida",
+    "llego",
+    "reembolsaron",
 )
 CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "food": ("sushi", "comida", "almuerzo", "cena", "desayuno", "restaurant", "restaurante", "supermercado"),
-    "transport": ("uber", "taxi", "metro", "bus", "bencina", "combustible", "peaje"),
-    "housing": ("arriendo", "dividendo", "gasto común", "gastos comunes", "luz", "agua", "gas", "internet"),
-    "health": ("farmacia", "doctor", "médico", "medico", "clínica", "clinica", "isapre", "fonasa"),
+    "food": ("sushi", "hamburguesa", "hamburguesas", "pan", "comida", "almuerzo", "cena", "desayuno", "restaurant", "restaurante", "supermercado"),
+    "transport": ("uber", "taxi", "metro", "bus", "bencina", "combustible", "peaje", "transporte"),
+    "housing": ("arriendo", "dividendo", "gasto comun", "gastos comunes", "luz", "agua", "gas", "internet"),
+    "health": ("farmacia", "doctor", "medico", "clinica", "isapre", "fonasa"),
     "entertainment": ("cine", "netflix", "spotify", "juego", "concierto", "bar"),
-    "transfer": ("devolvieron", "transferencia", "depositaron", "prestamo", "préstamo"),
+    "transfer": ("devolvieron", "transferencia", "transferi", "depositaron", "prestamo"),
     "salary": ("sueldo", "salario", "honorarios", "pago"),
 }
-AMOUNT_RE = re.compile(
-    r"(?P<number>\d{1,3}(?:[\.]\d{3})*|\d+)(?:\s*(?P<unit>lucas?|mil|miles|k|pesos?|clp))?",
-    re.IGNORECASE,
-)
 
 
 @dataclass(frozen=True)
-class ParseResult:
-    """Parsed transaction fields."""
+class ParsedTransaction:
+    """A parsed transaction with deterministic confidence metadata."""
 
-    amount_clp: int
-    transaction_type: str
-    category: str
-    description: str
+    transaction: Transaction
+    confidence: float
+    amount_segment: MoneySegment
+
+
+def parse_transactions(raw_text: str) -> list[ParsedTransaction]:
+    """Parse one or more transactions from a Spanish financial phrase."""
+    normalized = normalize_text(raw_text)
+    segments = extract_money_segments(normalized)
+    if not segments:
+        LOGGER.warning("Could not parse any amount from transcription: %s", raw_text)
+        return []
+
+    parsed: list[ParsedTransaction] = []
+    tokens = normalized.split()
+    for segment in segments:
+        context = _segment_context(tokens, segment)
+        transaction_type, type_confidence = _extract_transaction_type(context, normalized)
+        category, category_confidence = _extract_category(segment.description, context, transaction_type)
+        description = _clean_description(segment.description, context)
+        confidence = min(segment.confidence, type_confidence, category_confidence)
+        parsed.append(
+            ParsedTransaction(
+                transaction=Transaction(
+                    raw_text=raw_text,
+                    amount_clp=segment.amount_clp,
+                    transaction_type=transaction_type,
+                    category=category,
+                    description=description,
+                ),
+                confidence=confidence,
+                amount_segment=segment,
+            )
+        )
+    return parsed
 
 
 def parse_transaction(raw_text: str) -> Transaction | None:
-    """Parse a Spanish financial phrase into a transaction, or return None if no amount is found."""
-    normalized = _normalize(raw_text)
-    amount = _extract_amount(normalized)
-    if amount is None:
-        LOGGER.warning("Could not parse amount from transcription: %s", raw_text)
-        return None
-
-    transaction_type = _extract_transaction_type(normalized)
-    category = _extract_category(normalized, transaction_type)
-    description = _clean_description(normalized)
-    result = ParseResult(
-        amount_clp=amount,
-        transaction_type=transaction_type,
-        category=category,
-        description=description,
-    )
-    return Transaction(raw_text=raw_text, **result.__dict__)
+    """Backward-compatible helper returning the first parsed transaction, if any."""
+    parsed = parse_transactions(raw_text)
+    return parsed[0].transaction if parsed else None
 
 
-def _normalize(text: str) -> str:
-    return " ".join(text.strip().lower().split())
+def _segment_context(tokens: list[str], segment: MoneySegment) -> str:
+    start = max(0, segment.start_token - 6)
+    end = min(len(tokens), segment.end_token + 6)
+    return " ".join(tokens[start:end])
 
 
-def _extract_amount(text: str) -> int | None:
-    for match in AMOUNT_RE.finditer(text):
-        number_text = match.group("number").replace(".", "")
-        unit = (match.group("unit") or "").lower()
-        try:
-            number = int(number_text)
-        except ValueError:
-            continue
-        if unit in {"luca", "lucas", "mil", "miles", "k"}:
-            return number * 1000
-        return number
-    return None
+def _extract_transaction_type(context: str, full_text: str) -> tuple[str, float]:
+    if any(keyword in context for keyword in INCOME_KEYWORDS):
+        return "income", 0.95
+    if any(keyword in context for keyword in EXPENSE_KEYWORDS):
+        return "expense", 0.95
+    if any(keyword in full_text for keyword in INCOME_KEYWORDS):
+        return "income", 0.75
+    if any(keyword in full_text for keyword in EXPENSE_KEYWORDS):
+        return "expense", 0.75
+    return "expense", 0.45
 
 
-def _extract_transaction_type(text: str) -> str:
-    if any(keyword in text for keyword in INCOME_KEYWORDS):
-        return "income"
-    if any(keyword in text for keyword in EXPENSE_KEYWORDS):
-        return "expense"
-    return "expense"
-
-
-def _extract_category(text: str, transaction_type: str) -> str:
+def _extract_category(description: str, context: str, transaction_type: str) -> tuple[str, float]:
+    haystack = f"{description} {context}"
     for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(keyword in text for keyword in keywords):
-            return category
-    return "transfer" if transaction_type == "income" else "other"
+        if any(keyword in haystack for keyword in keywords):
+            return category, 0.95
+    if transaction_type == "income":
+        return "transfer", 0.80
+    return "other", 0.45
 
 
-def _clean_description(text: str) -> str:
-    without_amount = AMOUNT_RE.sub("", text, count=1)
-    stop_words = ("gasté", "gaste", "pagué", "pague", "compré", "compre", "en", "por", "me", "devolvieron")
-    words = [word for word in without_amount.split() if word not in stop_words]
-    return " ".join(words).strip() or text
+def _clean_description(description: str, context: str) -> str:
+    description = description.strip()
+    if description and description != "sin descripcion":
+        return description
+    stop_words = set(EXPENSE_KEYWORDS) | {"por", "en", "de", "me", "y", "despues", "luego"}
+    words = [word for word in context.split() if word not in stop_words and not word.isdigit()]
+    return " ".join(words).strip() or "sin descripcion"

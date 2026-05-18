@@ -1,6 +1,6 @@
 # Local-first Telegram Financial Assistant
 
-A CPU-only Python 3.11 Telegram bot that receives voice notes or text from one authorized user, transcribes voice locally with `whisper.cpp`, parses Chilean Spanish financial phrases, optionally enriches them with a local Qwen model, stores transactions in SQLite, and sends Spanish financial reports with PNG charts through Telegram.
+A CPU-only Python 3.11 Telegram bot that receives voice notes or text from one authorized user, transcribes voice locally with `whisper.cpp`, parses Chilean Spanish financial phrases, uses a local Qwen2.5 fallback only for ambiguous financial messages, stores transactions in SQLite, and sends Spanish financial reports with PNG charts through Telegram.
 
 ## Local-only architecture
 
@@ -13,17 +13,19 @@ WAV
 ↓
 whisper.cpp medium model
 ↓
-text
+transcribed text
 ↓
-regex parser
+financial pre-filter
 ↓
-optional local Qwen semantic analysis
+deterministic multi-amount parser
 ↓
-fusion layer
+ambiguity detector
+↓
+optional local Qwen fallback
 ↓
 intent router
 ↓
-SQLite storage or report/dashboard PNG generation
+SQLite storage or dashboard PNG generation
 ↓
 Spanish Telegram response
 ```
@@ -52,18 +54,19 @@ The authorized Telegram user ID defaults to `$$$$` in `config.py`; messages from
 
 ### Optional local Qwen semantic analysis
 
-The deterministic regex parser is always the primary parser. To add local semantic enrichment, run a small Qwen GGUF model with a local CPU runner such as `llama.cpp`:
+The deterministic parser is always the primary parser. Qwen is a fallback only: it is skipped for non-financial text and skipped whenever deterministic parsing is clear enough. To add local semantic fallback for ambiguous cases, run a small Qwen2.5 GGUF model with a local CPU runner such as `llama.cpp`:
 
 ```bash
 export QWEN_ENABLED="1"
 export QWEN_RUNNER_BINARY="/absolute/path/to/llama.cpp/build/bin/llama-cli"
 export QWEN_MODEL_PATH="/absolute/path/to/qwen-model.gguf"
 export QWEN_THREADS="4"
-export QWEN_MAX_TOKENS="160"
-export QWEN_TIMEOUT_SECONDS="45"
+export QWEN_MAX_TOKENS="32"
+export QWEN_CONTEXT_TOKENS="2048"
+export QWEN_TIMEOUT_SECONDS="20"
 ```
 
-If the local Qwen binary or model is missing, the bot logs a warning and continues with regex parsing only. No external LLM service is contacted.
+If the local Qwen binary or model is missing, the bot logs a warning and continues with deterministic parsing only. The Qwen prompt is intentionally short, requests only JSON, and uses low generation limits (`-n 32`, `-c 2048`, `--temp 0`) for CPU-only hardware. No external LLM service is contacted.
 
 ## Install Python dependencies
 
@@ -139,6 +142,8 @@ All Telegram responses are written in Spanish.
 
 - Send a voice note or text like `gasté 12 lucas en sushi` to save an expense of `12000` CLP in the `food` category.
 - Send a voice note or text like `me devolvieron 5 mil` to save income of `5000` CLP in the `transfer` category.
+- Send multiple transactions in one message, such as `compré sushi por 12 mil y después pagué 5 mil en Uber`, to create two SQLite rows.
+- Non-financial messages are ignored before any Qwen fallback can run.
 - `/daily` or `/diario` sends a daily summary and PNG charts.
 - `/weekly` or `/semanal` sends a weekly summary and PNG charts.
 - `/monthly` or `/mensual` sends a monthly summary and PNG charts.
@@ -156,10 +161,14 @@ Each report exports and sends:
 - `telegram_bot.py` handles authorization, Telegram audio/text, Spanish replies, and report PNG sending.
 - `audio_pipeline.py` converts OGG/Opus to WAV with ffmpeg.
 - `whisper_runner.py` executes whisper.cpp with JSON output.
-- `parser.py` extracts amount, transaction type, category, and description with deterministic regex/rules.
-- `qwen_analyzer.py` optionally executes a local Qwen model through a local subprocess.
-- `fusion.py` combines regex and local Qwen outputs with deterministic parsing as the source of truth.
-- `intent_router.py` detects report intents versus transaction intents.
+- `text_normalizer.py` normalizes accents, whitespace, punctuation, and Chilean money slang before parsing.
+- `financial_filter.py` rejects non-financial text before any Qwen fallback is considered.
+- `money_parser.py` extracts multiple CLP amounts, including `21 mil 500`, `3 lucas y media`, and `12 mil 200 pesos`.
+- `parser.py` creates one or more deterministic transactions with type/category/description confidence.
+- `ambiguity_detector.py` decides whether deterministic parsing is sufficient; when it is, Qwen is never called.
+- `qwen_analyzer.py` optionally executes a local Qwen2.5 GGUF model through llama.cpp with strict JSON and short generation settings.
+- `fusion.py` combines deterministic and fallback outputs without letting Qwen override clear amounts or generate SQL.
+- `intent_router.py` detects dashboard/report intents versus transaction intents.
 - `database.py` initializes and safely queries SQLite.
 - `reporting.py` creates daily, weekly, monthly, and historical summaries plus PNG charts.
 - `config.py` centralizes local paths and environment variables.

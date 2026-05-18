@@ -34,8 +34,9 @@ class Settings:
     )
     qwen_model_path: Path = field(default_factory=lambda: Path(os.environ.get("QWEN_MODEL_PATH", "models/qwen.gguf")))
     qwen_threads: int = field(default_factory=lambda: int(os.environ.get("QWEN_THREADS", "4")))
-    qwen_max_tokens: int = field(default_factory=lambda: int(os.environ.get("QWEN_MAX_TOKENS", "160")))
-    qwen_timeout_seconds: int = field(default_factory=lambda: int(os.environ.get("QWEN_TIMEOUT_SECONDS", "45")))
+    qwen_max_tokens: int = field(default_factory=lambda: int(os.environ.get("QWEN_MAX_TOKENS", "32")))
+    qwen_context_tokens: int = field(default_factory=lambda: int(os.environ.get("QWEN_CONTEXT_TOKENS", "2048")))
+    qwen_timeout_seconds: int = field(default_factory=lambda: int(os.environ.get("QWEN_TIMEOUT_SECONDS", "20")))
 
     @property
     def voice_dir(self) -> Path:

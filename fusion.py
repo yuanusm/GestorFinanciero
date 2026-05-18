@@ -1,58 +1,71 @@
-"""Fusion layer combining deterministic parsing with optional local Qwen output."""
+"""Fusion helpers for deterministic parsing plus optional local Qwen fallback."""
 
 from __future__ import annotations
 
 from database import Transaction
+from parser import ParsedTransaction
 from qwen_analyzer import SemanticAnalysis
 
 
+def fuse_transactions(raw_text: str, deterministic: list[ParsedTransaction], semantic: SemanticAnalysis | None) -> list[Transaction]:
+    """Return final transactions while keeping deterministic parsing authoritative."""
+    if not deterministic and semantic is None:
+        return []
+    if not deterministic:
+        return _transactions_from_semantic(raw_text, semantic)
+    if semantic is None or semantic.confidence < 0.70:
+        return [item.transaction for item in deterministic]
+
+    semantic_items = semantic.transactions
+    fused: list[Transaction] = []
+    for index, parsed in enumerate(deterministic):
+        tx = parsed.transaction
+        semantic_tx = semantic_items[index] if index < len(semantic_items) else None
+        category = tx.category
+        description = tx.description
+        transaction_type = tx.transaction_type
+        if semantic_tx is not None:
+            if category == "other" and semantic_tx.category:
+                category = semantic_tx.category
+            if description == "sin descripcion" and semantic_tx.description:
+                description = semantic_tx.description
+            if parsed.confidence < 0.70 and semantic_tx.transaction_type:
+                transaction_type = semantic_tx.transaction_type
+        fused.append(
+            Transaction(
+                raw_text=raw_text,
+                amount_clp=tx.amount_clp,
+                transaction_type=transaction_type,
+                category=category,
+                description=description,
+                timestamp=tx.timestamp,
+            )
+        )
+    return fused
+
 
 def fuse_transaction(raw_text: str, deterministic: Transaction | None, semantic: SemanticAnalysis | None) -> Transaction | None:
-    """Create the final transaction while preferring deterministic parser values.
-
-    The deterministic regex parser is authoritative for the amount when it found
-    one. Local Qwen can fill missing fields or improve generic categories when it
-    has enough confidence, but it cannot turn an existing parsed transaction into
-    arbitrary SQL or commands.
-    """
-    if deterministic is None and semantic is None:
-        return None
-    if deterministic is None:
-        return _transaction_from_semantic(raw_text, semantic)
-    if semantic is None or semantic.confidence < 0.70:
+    """Backward-compatible single-transaction fusion helper."""
+    if deterministic is not None:
         return deterministic
-
-    category = deterministic.category
-    if category in {"other", "transfer"} and semantic.category:
-        category = semantic.category
-
-    description = deterministic.description
-    if description == raw_text.lower().strip() and semantic.description:
-        description = semantic.description
-
-    transaction_type = deterministic.transaction_type
-    if semantic.transaction_type and deterministic.transaction_type == "expense":
-        transaction_type = semantic.transaction_type
-
-    return Transaction(
-        raw_text=raw_text,
-        amount_clp=deterministic.amount_clp,
-        transaction_type=transaction_type,
-        category=category,
-        description=description,
-        timestamp=deterministic.timestamp,
-    )
+    transactions = _transactions_from_semantic(raw_text, semantic)
+    return transactions[0] if transactions else None
 
 
-def _transaction_from_semantic(raw_text: str, semantic: SemanticAnalysis | None) -> Transaction | None:
-    if semantic is None or semantic.confidence < 0.80:
-        return None
-    if semantic.amount_clp is None or semantic.transaction_type is None:
-        return None
-    return Transaction(
-        raw_text=raw_text,
-        amount_clp=semantic.amount_clp,
-        transaction_type=semantic.transaction_type,
-        category=semantic.category or ("transfer" if semantic.transaction_type == "income" else "other"),
-        description=semantic.description or raw_text,
-    )
+def _transactions_from_semantic(raw_text: str, semantic: SemanticAnalysis | None) -> list[Transaction]:
+    if semantic is None or semantic.confidence < 0.80 or semantic.intent != "create_transaction":
+        return []
+    transactions: list[Transaction] = []
+    for item in semantic.transactions:
+        if item.amount_clp is None or item.transaction_type is None:
+            continue
+        transactions.append(
+            Transaction(
+                raw_text=raw_text,
+                amount_clp=item.amount_clp,
+                transaction_type=item.transaction_type,
+                category=item.category or ("transfer" if item.transaction_type == "income" else "other"),
+                description=item.description or "sin descripcion",
+            )
+        )
+    return transactions
