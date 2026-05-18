@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from text_normalizer import normalize_text
 
-MONEY_UNITS = {"peso", "pesos", "clp", "luca", "lucas", "mil", "miles", "k"}
+MONEY_UNITS = {"peso", "pesos", "clp", "luca", "lucas", "mil", "miles", "k", "gamba", "gambas", "palo", "palos"}
 CONNECTORS = {"y", "con", "de", "unos", "un", "una", "como", "aprox", "aproximadamente"}
 STOP_WORDS = {
     "gaste",
@@ -153,6 +153,17 @@ def _parse_amount_at(tokens: list[str], index: int) -> tuple[int, int, float] | 
                 amount += remainder
                 end_index += 1
         return amount, _consume_currency(tokens, end_index), 0.95
+
+
+    if unit in {"gamba", "gambas"}:
+        amount = number * 100
+        end_index = next_index + 1
+        return amount, _consume_currency(tokens, end_index), 0.90
+
+    if unit in {"palo", "palos"}:
+        amount = number * 1_000_000
+        end_index = next_index + 1
+        return amount, _consume_currency(tokens, end_index), 0.90
 
     if unit in {"mil", "miles"}:
         amount = number * 1000

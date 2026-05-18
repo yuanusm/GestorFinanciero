@@ -25,9 +25,9 @@ def detect_ambiguity(parsed: list[ParsedTransaction], *, is_dashboard_intent: bo
         tx = item.transaction
         if item.confidence < 0.70:
             return AmbiguityResult(True, "low deterministic confidence")
-        if tx.transaction_type not in {"expense", "income"}:
+        if item.transaction_type_confidence < 0.70 or tx.transaction_type not in {"expense", "income"}:
             return AmbiguityResult(True, "unclear transaction type")
-        if tx.category == "other":
+        if tx.category == "other" and item.category_confidence < 0.70:
             return AmbiguityResult(True, "unclear category")
         if tx.description == "sin descripcion":
             return AmbiguityResult(True, "unclear description")

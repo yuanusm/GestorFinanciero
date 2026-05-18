@@ -156,14 +156,29 @@ def export_summary_chart(summary: Summary, output_path: Path) -> Path:
 
 
 def export_report_charts(summary: Summary, output_dir: Path) -> list[Path]:
-    """Export all PNG report charts and return their paths."""
+    """Export all PNG report charts and return their paths.
+
+    If matplotlib is unavailable or fails during chart creation, write valid PNG
+    placeholders so Telegram report delivery keeps working offline.
+    """
     safe_start = summary.start.date().isoformat() if summary.start else "historico"
     prefix = f"{summary.period}_{safe_start}"
-    return [
-        export_summary_chart(summary, output_dir / f"{prefix}_resumen.png"),
-        export_category_distribution_chart(summary, output_dir / f"{prefix}_categorias.png"),
-        export_trend_chart(summary, output_dir / f"{prefix}_tendencia.png"),
+    paths = [
+        output_dir / f"{prefix}_resumen.png",
+        output_dir / f"{prefix}_categorias.png",
+        output_dir / f"{prefix}_tendencia.png",
     ]
+    try:
+        return [
+            export_summary_chart(summary, paths[0]),
+            export_category_distribution_chart(summary, paths[1]),
+            export_trend_chart(summary, paths[2]),
+        ]
+    except RuntimeError:
+        LOGGER.exception("matplotlib unavailable; writing fallback PNG report placeholders")
+        for path in paths:
+            _write_fallback_png(path)
+        return paths
 
 
 def format_summary(summary: Summary) -> str:
