@@ -60,6 +60,7 @@ class SemanticAnalysis:
     transactions: list[QwenTransaction]
     report_period: ReportPeriod | None
     confidence: float
+    raw_output: str
 
 
 class QwenAnalysisError(RuntimeError):
@@ -146,6 +147,7 @@ def _parse_semantic_json(output: str) -> SemanticAnalysis | None:
         transactions=transactions,
         report_period=report_period if report_period in {"daily", "weekly", "monthly", "historical"} else None,
         confidence=confidence,
+        raw_output=output.strip(),
     )
 
 

@@ -44,6 +44,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("No pude procesar el audio de forma segura. Revisa los logs locales para más detalles.")
         return
 
+    await update.message.reply_text(f"🎙️ Transcripción: {transcript}")
     await _handle_text_intent(update, context, transcript)
 
 
@@ -116,6 +117,8 @@ async def _handle_text_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         LOGGER.info("Using Qwen fallback: %s", ambiguity.reason)
         try:
             semantic = analyze_with_qwen(text, settings)
+            if semantic is not None and semantic.raw_output:
+                await update.message.reply_text(f"🤖 Raw LLM: {semantic.raw_output}")
         except QwenAnalysisError:
             LOGGER.exception("Local Qwen fallback failed; continuing with deterministic parser")
 
