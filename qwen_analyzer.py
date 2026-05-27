@@ -12,12 +12,34 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from config import Settings
+from settings import Settings
 
 LOGGER = logging.getLogger(__name__)
 VALID_TYPES = {"expense", "income"}
 VALID_INTENTS = {"create_transaction", "dashboard", "ignore"}
 ReportPeriod = Literal["daily", "weekly", "monthly", "historical"]
+
+LLAMA_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string", "enum": ["create_transaction", "dashboard", "ignore"]},
+        "transactions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "amount_clp": {"type": "integer"},
+                    "transaction_type": {"type": "string", "enum": ["expense", "income"]},
+                    "category": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["amount_clp", "transaction_type", "category", "description"],
+            },
+        },
+        "report_period": {"type": ["string", "null"]},
+    },
+    "required": ["intent", "transactions", "report_period"],
+}
 
 
 @dataclass(frozen=True)
@@ -38,6 +60,7 @@ class SemanticAnalysis:
     transactions: list[QwenTransaction]
     report_period: ReportPeriod | None
     confidence: float
+    raw_output: str
 
 
 class QwenAnalysisError(RuntimeError):
@@ -45,7 +68,7 @@ class QwenAnalysisError(RuntimeError):
 
 
 def analyze_with_qwen(text: str, settings: Settings) -> SemanticAnalysis | None:
-    """Run local Qwen fallback with short output limits and parse strict JSON."""
+    """Run local Qwen fallback with llama.cpp JSON Schema constraints."""
     if not settings.qwen_enabled:
         LOGGER.info("Local Qwen fallback disabled")
         return None
@@ -67,8 +90,15 @@ def analyze_with_qwen(text: str, settings: Settings) -> SemanticAnalysis | None:
         str(settings.qwen_threads),
         "--temp",
         "0",
+        "--top-k",
+        "1",
+        "--top-p",
+        "0",
+        "--no-perf",
+        "--json-schema",
+        json.dumps(LLAMA_JSON_SCHEMA),
     ]
-    LOGGER.info("Running local Qwen fallback")
+    LOGGER.info("Running local Qwen fallback with JSON Schema")
     try:
         completed = subprocess.run(
             command,
@@ -89,12 +119,10 @@ def analyze_with_qwen(text: str, settings: Settings) -> SemanticAnalysis | None:
 
 def _build_prompt(text: str) -> str:
     return (
-        "Responde SOLO JSON.\n"
-        f"Texto:\n{json.dumps(text, ensure_ascii=False)}\n"
-        "Formato:\n"
-        "{\"intent\":\"create_transaction|dashboard|ignore\","
-        "\"amount_clp\":12000,\"transaction_type\":\"expense\","
-        "\"category\":\"food\",\"report_period\":null}"
+        "Responde SOLO JSON valido. Sin markdown, sin explicaciones, sin texto extra.\n"
+        "Decide intent: create_transaction, dashboard o ignore.\n"
+        "Usa income si recibe plata; expense si gasta/paga/compra.\n"
+        f"Texto: {json.dumps(text, ensure_ascii=False)}"
     )
 
 
@@ -105,21 +133,21 @@ def _parse_semantic_json(output: str) -> SemanticAnalysis | None:
         return None
 
     intent = payload.get("intent")
-    transaction = _transaction_from_payload(payload)
     transactions_payload = payload.get("transactions")
     transactions: list[QwenTransaction] = []
     if isinstance(transactions_payload, list):
         transactions = [_transaction_from_payload(item) for item in transactions_payload if isinstance(item, dict)]
-    elif transaction.amount_clp is not None or transaction.category is not None or transaction.transaction_type is not None:
-        transactions = [transaction]
 
     report_period = payload.get("report_period")
-    confidence = payload.get("confidence", 0.70 if intent in VALID_INTENTS else 0.0)
+    confidence = 0.80 if intent in VALID_INTENTS else 0.0
+    if intent == "create_transaction" and not transactions:
+        confidence = 0.0
     return SemanticAnalysis(
         intent=intent if isinstance(intent, str) and intent in VALID_INTENTS else None,
         transactions=transactions,
         report_period=report_period if report_period in {"daily", "weekly", "monthly", "historical"} else None,
-        confidence=float(confidence) if isinstance(confidence, int | float) else 0.0,
+        confidence=confidence,
+        raw_output=output.strip(),
     )
 
 

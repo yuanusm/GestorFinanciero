@@ -9,10 +9,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from audio_pipeline import AudioPipelineError, transcribe_voice_message
-from config import Settings, load_settings
+from settings import Settings, load_settings
 from ambiguity_detector import detect_ambiguity
 from database import Transaction, initialize_database, insert_transaction
-from financial_filter import is_financially_relevant
+from financial_prefilter import is_financially_relevant
 from fusion import fuse_transactions
 from intent_router import ReportPeriod, route_intent
 from parser import parse_transactions
@@ -44,6 +44,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("No pude procesar el audio de forma segura. Revisa los logs locales para más detalles.")
         return
 
+    await update.message.reply_text(f"🎙️ Transcripción: {transcript}")
     await _handle_text_intent(update, context, transcript)
 
 
@@ -116,6 +117,8 @@ async def _handle_text_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         LOGGER.info("Using Qwen fallback: %s", ambiguity.reason)
         try:
             semantic = analyze_with_qwen(text, settings)
+            if semantic is not None and semantic.raw_output:
+                await update.message.reply_text(f"🤖 Raw LLM: {semantic.raw_output}")
         except QwenAnalysisError:
             LOGGER.exception("Local Qwen fallback failed; continuing with deterministic parser")
 
